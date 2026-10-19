@@ -176,3 +176,44 @@ body {
   .toast-container { left: 0; right: 0; }
   .toast-container .toast { width: 100%; }
 }
+
+/* Comentarios escritos por el alumno */
+.comentario-alumno {
+  background: #eef7f0;
+  border-left-color: #198754;
+}
+
+/* ---------- Calificaciones por unidad ---------- */
+.unidades-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: .5rem;
+}
+@media (min-width: 768px) {
+  .unidades-grid { grid-template-columns: repeat(8, minmax(0, 1fr)); }
+}
+.unidad-input {
+  display: flex;
+  flex-direction: column;
+  gap: .2rem;
+  margin: 0;
+  font-size: .7rem;
+  font-weight: 700;
+  letter-spacing: .05em;
+  color: #6c757d;
+}
+.unidad-input input { text-align: center; padding-left: .25rem; padding-right: .25rem; }
+
+.unidades-chips { display: flex; flex-wrap: wrap; gap: .45rem; }
+.unit-chip {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  min-width: 3.2rem;
+  padding: .35rem .55rem;
+  border: 1px solid transparent;
+  border-radius: .65rem;
+  line-height: 1.15;
+}
+.unit-chip small { font-size: .65rem; font-weight: 700; letter-spacing: .05em; opacity: .75; }
+.unit-chip strong { font-size: 1.05rem; }

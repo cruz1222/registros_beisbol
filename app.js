@@ -1,16 +1,16 @@
 /* ==========================================================
    Sistema de Control de Alumnos y Selección de Béisbol
-   Lógica de la aplicación (sin backend, datos en LocalStorage)
+   Lógica de la aplicación (datos y autenticación en Supabase)
    ----------------------------------------------------------
    Secciones:
    1. Configuración
    2. Utilidades
-   3. Capa de datos (LocalStorage)
+   3. Capa de datos (Supabase)
    4. Reglas de negocio (semáforo, promedios)
-   5. Autenticación del Manager (simulada)
+   5. Autenticación del Manager (Supabase Auth)
    6. Router y navegación
    7. Vista: Registro de aspirante
-   8. Vista: Perfil del alumno
+   8. Vista: Perfil del alumno (consulta con n.º de control + comentarios)
    9. Vista: Panel del Manager (alumnos, modal, selección)
    10. Datos: exportar / importar / demo
    11. Eventos globales e inicialización
@@ -22,16 +22,17 @@
      1. CONFIGURACIÓN
      ======================================================== */
   const CONFIG = {
-    // ⚠️ Login SIMULADO: las credenciales viven en el código del cliente.
-    // Cámbialas aquí. Para producción real se necesita un backend.
-    ADMIN_USER: 'manager',
-    ADMIN_PASS: 'beisbol2026',
+    // Proyecto de Supabase: Project Settings → API.
+    // La clave "anon" (o "publishable") es pública por diseño; la seguridad real
+    // la dan las políticas RLS de supabase/schema.sql.
+    SUPABASE_URL: 'https://psolmpdigawyqfkbjzdx.supabase.co',
+    SUPABASE_ANON_KEY: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBzb2xtcGRpZ2F3eXFma2JqemR4Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTIzNzIyMDMsImV4cCI6MjEwNzk0ODIwM30.kfOFwryJwyKlm8vlT6S3ECOKmVc2JxY9ICHpISESc6k',
 
-    STORAGE_KEY: 'beisbol_alumnos_v1',      // datos (localStorage)
-    SESSION_KEY: 'beisbol_manager_session', // sesión del manager (sessionStorage)
-    PROFILE_KEY: 'beisbol_perfil_actual',   // perfil abierto por el alumno (sessionStorage)
+    MAX_UNIDADES: 8,       // unidades por materia (si lo cambias, cambia también el check en supabase/schema.sql)
 
-    MAX_INTENTOS: 5,       // intentos fallidos de login antes de bloquear
+    LEGACY_STORAGE_KEY: 'beisbol_alumnos_v1', // datos de la versión anterior (localStorage)
+
+    MAX_INTENTOS: 5,       // intentos fallidos de login del manager antes de bloquear
     BLOQUEO_MS: 30000      // duración del bloqueo (ms)
   };
 
@@ -49,8 +50,18 @@
   const $ = (sel, root = document) => root.querySelector(sel);
   const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
   const norm = (v) => String(v ?? '').trim().toLowerCase();
-  const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+  // UUID v4 (las materias se guardan en Supabase con id uuid)
+  const uid = () => (window.crypto && crypto.randomUUID)
+    ? crypto.randomUUID()
+    : 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+      const r = Math.random() * 16 | 0;
+      return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
+    });
   const clamp = (n) => Math.min(100, Math.max(0, Math.round(n * 10) / 10));
+  /** Promedio de una lista [{calificacion}] (null si está vacía) */
+  const avgUnidades = (list) => list.length
+    ? Math.round((list.reduce((a, u) => a + u.calificacion, 0) / list.length) * 10) / 10
+    : null;
 
   // Escapa HTML para evitar inyección (XSS) al pintar datos capturados
   const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => (
@@ -58,6 +69,7 @@
   ));
 
   const ID_REGEX = /^[A-Za-z0-9-]{4,20}$/;
+  const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
   /** Notificación tipo toast */
   function toast(msg, type = 'success') {
@@ -113,6 +125,18 @@
    */
   let db = [];
 
+  /* ---------- Cliente de Supabase ---------- */
+  const configOk = () => !/TU-PROYECTO|TU-ANON-KEY/.test(CONFIG.SUPABASE_URL + CONFIG.SUPABASE_ANON_KEY);
+  const sb = supabase.createClient(CONFIG.SUPABASE_URL, CONFIG.SUPABASE_ANON_KEY);
+  const auth = { role: null, user: null }; // role: 'manager' | null (el alumno no inicia sesión)
+  const PERFIL_KEY = 'beisbol_perfil_actual'; // n.º de control abierto por el alumno (sessionStorage)
+  let perfil = null;                          // perfil del alumno abierto (viene de consultar_perfil)
+
+  function dbError(ctx, error) {
+    console.error(ctx, error);
+    toast(`${ctx}: ${error && error.message ? error.message : 'error desconocido'}`, 'danger');
+  }
+
   /** Normaliza y valida un alumno (también se usa al importar JSON) */
   function sanitizeStudent(s) {
     if (!s || typeof s !== 'object') return null;
@@ -125,17 +149,36 @@
       .map((m) => {
         const raw = m.calificacion;
         const hasGrade = raw !== null && raw !== undefined && raw !== '' && !isNaN(Number(raw));
+
+        // Calificaciones por unidad (1..MAX_UNIDADES, sin repetir)
+        const vistas = new Set();
+        let unidades = (Array.isArray(m.unidades) ? m.unidades : [])
+          .map((u) => ({ n: Math.round(Number(u && u.n)), g: u ? u.calificacion : null }))
+          .filter((u) => Number.isInteger(u.n) && u.n >= 1 && u.n <= CONFIG.MAX_UNIDADES
+            && u.g !== null && u.g !== undefined && u.g !== '' && !isNaN(Number(u.g)))
+          .map((u) => ({ n: u.n, calificacion: clamp(Number(u.g)) }))
+          .filter((u) => !vistas.has(u.n) && vistas.add(u.n))
+          .sort((a, b) => a.n - b.n);
+        // Respaldos antiguos con una sola calificación por materia → Unidad 1
+        if (!unidades.length && hasGrade) unidades = [{ n: 1, calificacion: clamp(Number(raw)) }];
+
         return {
-          id: m.id || uid(),
+          id: UUID_REGEX.test(String(m.id ?? '')) ? m.id : uid(),
           nombre: String(m.nombre ?? '').trim(),
-          calificacion: hasGrade ? clamp(Number(raw)) : null,
-          comentario: String(m.comentario ?? '').trim()
+          unidades,
+          calificacion: avgUnidades(unidades), // promedio de la materia (calculado)
+          comentario: String(m.comentario ?? '').trim(),
+          // Comentarios escritos por el alumno (solo lectura para el manager)
+          comentarios: (Array.isArray(m.comentarios) ? m.comentarios : [])
+            .map((c) => ({ id: c && c.id, texto: String((c && c.texto) ?? '').trim(), creadoEn: (c && c.creadoEn) || '' }))
+            .filter((c) => c.texto)
         };
       })
       .filter((m) => m.nombre);
 
     return {
       id,
+      uuid: UUID_REGEX.test(String(s.uuid ?? '')) ? s.uuid : null, // id interno en Supabase
       nombre,
       carrera: String(s.carrera ?? '').trim(),
       materias,
@@ -146,22 +189,126 @@
     };
   }
 
-  function loadDB() {
-    try {
-      const raw = localStorage.getItem(CONFIG.STORAGE_KEY);
-      const parsed = raw ? JSON.parse(raw) : [];
-      db = (Array.isArray(parsed) ? parsed : []).map(sanitizeStudent).filter(Boolean);
-    } catch (e) {
-      db = [];
-    }
+  /** Fila de Supabase (alumnos + materias + comentarios) → objeto de la app */
+  function fromRow(r) {
+    const byDate = (a, b) => String(a.created_at).localeCompare(String(b.created_at));
+    return sanitizeStudent({
+      id: r.numero_control,
+      uuid: r.id,
+      nombre: r.nombre,
+      carrera: r.carrera,
+      nivel: r.nivel,
+      posiciones: r.posiciones,
+      seleccionado: r.seleccionado,
+      creadoEn: r.created_at,
+      materias: (r.materias || []).slice().sort(byDate).map((m) => ({
+        id: m.id,
+        nombre: m.nombre,
+        comentario: m.comentario,
+        unidades: (m.unidades || []).map((u) => ({ n: u.numero, calificacion: u.calificacion })),
+        comentarios: (m.comentarios || []).slice().sort(byDate)
+          .map((c) => ({ id: c.id, texto: c.texto, creadoEn: c.created_at }))
+      }))
+    });
   }
 
-  function saveDB() {
-    try {
-      localStorage.setItem(CONFIG.STORAGE_KEY, JSON.stringify(db));
-    } catch (e) {
-      toast('No se pudo guardar: el almacenamiento del navegador está lleno o bloqueado.', 'danger');
+  /** JSON de la función consultar_perfil → objeto de la app */
+  function fromPerfil(p) {
+    if (!p) return null;
+    return sanitizeStudent({
+      id: p.numero_control,
+      nombre: p.nombre,
+      carrera: p.carrera,
+      nivel: p.nivel,
+      posiciones: p.posiciones,
+      seleccionado: p.seleccionado,
+      creadoEn: p.created_at,
+      materias: (p.materias || []).map((m) => ({
+        id: m.id, nombre: m.nombre, comentario: m.comentario,
+        unidades: (m.unidades || []).map((u) => ({ n: u.numero, calificacion: u.calificacion })),
+        comentarios: (m.comentarios || []).map((c) => ({ id: c.id, texto: c.texto, creadoEn: c.created_at }))
+      }))
+    });
+  }
+
+  /** Carga desde Supabase lo que la sesión puede ver (solo el manager; las tablas están protegidas por RLS) */
+  async function loadDB() {
+    const { data, error } = await sb
+      .from('alumnos')
+      .select('*, materias(*, comentarios(*), unidades(*))')
+      .order('nombre');
+    if (error) {
+      db = [];
+      dbError('No se pudieron cargar los datos', error);
+      return false;
     }
+    db = data.map(fromRow).filter(Boolean);
+    return true;
+  }
+
+  /** Guarda (crea o actualiza) un alumno y sincroniza sus materias. Solo manager. Lanza error si falla. */
+  async function persistStudent(s) {
+    const row = {
+      numero_control: s.id,
+      nombre: s.nombre,
+      carrera: s.carrera,
+      nivel: s.nivel,
+      posiciones: s.posiciones,
+      seleccionado: s.seleccionado
+    };
+    if (s.uuid) {
+      const { error } = await sb.from('alumnos').update(row).eq('id', s.uuid);
+      if (error) throw error;
+    } else {
+      const { data, error } = await sb.from('alumnos').insert(row).select('id').single();
+      if (error) throw error;
+      s.uuid = data.id;
+    }
+
+    // Materias: borra las que ya no están y hace upsert del resto
+    const { data: existentes, error: e2 } = await sb.from('materias').select('id').eq('alumno_id', s.uuid);
+    if (e2) throw e2;
+    const keep = new Set(s.materias.map((m) => m.id));
+    const borrar = existentes.map((x) => x.id).filter((id) => !keep.has(id));
+    if (borrar.length) {
+      const { error } = await sb.from('materias').delete().in('id', borrar);
+      if (error) throw error;
+    }
+    if (s.materias.length) {
+      const rows = s.materias.map((m) => ({
+        id: m.id,
+        alumno_id: s.uuid,
+        nombre: m.nombre,
+        comentario: m.comentario
+      }));
+      const { error } = await sb.from('materias').upsert(rows);
+      if (error) throw error;
+
+      // Calificaciones por unidad: upsert de las capturadas y borrado de las que se quitaron
+      const unidadRows = s.materias.flatMap((m) =>
+        m.unidades.map((u) => ({ materia_id: m.id, numero: u.n, calificacion: u.calificacion })));
+      if (unidadRows.length) {
+        const { error: e3 } = await sb.from('unidades').upsert(unidadRows, { onConflict: 'materia_id,numero' });
+        if (e3) throw e3;
+      }
+      const { data: actuales, error: e4 } = await sb.from('unidades').select('id, materia_id, numero').in('materia_id', s.materias.map((m) => m.id));
+      if (e4) throw e4;
+      const vigentes = new Set(unidadRows.map((r) => `${r.materia_id}:${r.numero}`));
+      const sobran = actuales.filter((x) => !vigentes.has(`${x.materia_id}:${x.numero}`)).map((x) => x.id);
+      if (sobran.length) {
+        const { error: e5 } = await sb.from('unidades').delete().in('id', sobran);
+        if (e5) throw e5;
+      }
+    }
+    return s;
+  }
+
+  /** Al importar un alumno que ya existe, reutiliza sus ids (así no se pierden los comentarios del alumno) */
+  function reconcileIds(s, prev) {
+    if (!prev) return;
+    s.uuid = prev.uuid;
+    const byName = new Map(prev.materias.map((m) => [norm(m.nombre), m.id]));
+    s.materias.forEach((m) => { if (byName.has(norm(m.nombre))) m.id = byName.get(norm(m.nombre)); });
   }
 
   const findStudent = (id) => db.find((s) => norm(s.id) === norm(id));
@@ -219,7 +366,7 @@
   /* ========================================================
      5. AUTENTICACIÓN DEL MANAGER (simulada)
      ======================================================== */
-  const isManager = () => sessionStorage.getItem(CONFIG.SESSION_KEY) === '1';
+  const isManager = () => auth.role === 'manager';
   let intentosFallidos = 0;
   let bloqueadoHasta = 0;
 
@@ -232,51 +379,98 @@
     return true;
   }
 
+  /** Determina el rol de la sesión (manager si su usuario está en la tabla "managers") */
+  async function resolveRole(session) {
+    auth.user = session ? session.user : null;
+    auth.role = null;
+    if (!session) { db = []; return; }
+    const { data, error } = await sb.rpc('es_manager');
+    if (!error && data === true) auth.role = 'manager';
+  }
+
   function updateAuthUI() {
     const on = isManager();
-    $('#navLogoutItem').classList.toggle('d-none', !on);
+    $('#navLogoutItem').classList.toggle('d-none', !auth.role);
     $('#navManagerLabel').textContent = on ? 'Panel Manager' : 'Manager';
     $('#managerLogin').classList.toggle('d-none', on);
     $('#managerPanel').classList.toggle('d-none', !on);
   }
 
-  function handleLogin(e) {
+  /** Login del manager (correo + contraseña de Supabase Auth) */
+  async function handleLogin(e) {
     e.preventDefault();
+    const form = e.target;
     const err = $('#loginError');
     err.classList.add('d-none');
+    const showErr = (msg) => { err.textContent = msg; err.classList.remove('d-none'); };
 
     if (Date.now() < bloqueadoHasta) {
       const s = Math.ceil((bloqueadoHasta - Date.now()) / 1000);
-      err.textContent = `Demasiados intentos. Espera ${s} s e inténtalo de nuevo.`;
+      return showErr(`Demasiados intentos. Espera ${s} s e inténtalo de nuevo.`);
+    }
+
+    const email = $('#loginUser').value.trim();
+    const password = $('#loginPass').value;
+    const { data, error } = await sb.auth.signInWithPassword({ email, password });
+
+    if (!error) {
+      await resolveRole(data.session);
+      if (isManager()) {
+        intentosFallidos = 0;
+        form.reset();
+        await loadDB();
+        updateAuthUI();
+        renderManager();
+        toast('Bienvenido, Manager.');
+        return;
+      }
+      // Cuenta válida pero sin rol de manager
+      await sb.auth.signOut();
+      await resolveRole(null);
+      $('#loginPass').value = '';
+      return showErr('Esta cuenta no tiene permisos de manager.');
+    }
+
+    intentosFallidos++;
+    if (intentosFallidos >= CONFIG.MAX_INTENTOS) {
+      bloqueadoHasta = Date.now() + CONFIG.BLOQUEO_MS;
+      intentosFallidos = 0;
+      showErr(`Demasiados intentos. Acceso bloqueado ${CONFIG.BLOQUEO_MS / 1000} s.`);
+    } else {
+      showErr('Correo o contraseña incorrectos.');
+    }
+    $('#loginPass').value = '';
+  }
+
+  /** Búsqueda del perfil del alumno por número de control */
+  async function handleSearchProfile(e) {
+    e.preventDefault();
+    const err = $('#perfilError');
+    err.classList.add('d-none');
+    const id = $('#perfilId').value.trim();
+    if (!id) return;
+    const ok = await abrirPerfil(id);
+    if (!ok) {
+      err.textContent = 'No encontramos ese número de control. Verifica o regístrate primero.';
       err.classList.remove('d-none');
       return;
     }
-
-    const user = $('#loginUser').value.trim();
-    const pass = $('#loginPass').value;
-    if (user === CONFIG.ADMIN_USER && pass === CONFIG.ADMIN_PASS) {
-      sessionStorage.setItem(CONFIG.SESSION_KEY, '1');
-      intentosFallidos = 0;
-      e.target.reset();
-      updateAuthUI();
-      renderManager();
-      toast('Bienvenido, Manager.');
-    } else {
-      intentosFallidos++;
-      if (intentosFallidos >= CONFIG.MAX_INTENTOS) {
-        bloqueadoHasta = Date.now() + CONFIG.BLOQUEO_MS;
-        intentosFallidos = 0;
-        err.textContent = `Demasiados intentos. Acceso bloqueado ${CONFIG.BLOQUEO_MS / 1000} s.`;
-      } else {
-        err.textContent = 'Usuario o contraseña incorrectos.';
-      }
-      err.classList.remove('d-none');
-      $('#loginPass').value = '';
-    }
+    $('#perfilId').value = '';
+    renderProfileView();
   }
 
-  function logout() {
-    sessionStorage.removeItem(CONFIG.SESSION_KEY);
+  /** Pide a Supabase el perfil de un número de control (devuelve true si existe) */
+  async function abrirPerfil(id) {
+    const { data, error } = await sb.rpc('consultar_perfil', { p_numero_control: id });
+    if (error) { dbError('No se pudo consultar el perfil', error); return false; }
+    perfil = fromPerfil(data);
+    if (perfil) sessionStorage.setItem(PERFIL_KEY, perfil.id); else sessionStorage.removeItem(PERFIL_KEY);
+    return !!perfil;
+  }
+
+  async function logout() {
+    await sb.auth.signOut();
+    await resolveRole(null);
     updateAuthUI();
     location.hash = '#/inicio';
     toast('Sesión cerrada.', 'secondary');
@@ -312,12 +506,31 @@
      ======================================================== */
   function addRegRow(value = '') {
     const row = document.createElement('div');
-    row.className = 'input-group mb-2';
+    row.className = 'reg-materia card card-body bg-light border mb-3';
+    const unidades = Array.from({ length: CONFIG.MAX_UNIDADES }, (_, i) => `
+      <label class="unidad-input"><span>U${i + 1}</span>
+        <input type="number" class="form-control form-control-sm" data-unidad="${i + 1}" min="0" max="100" step="0.1" inputmode="decimal" placeholder="—" aria-label="Calificación de la unidad ${i + 1}">
+      </label>`).join('');
     row.innerHTML = `
-      <span class="input-group-text"><i class="bi bi-book"></i></span>
-      <input type="text" class="form-control" placeholder="Ej. Cálculo Diferencial" maxlength="60" value="${esc(value)}" aria-label="Nombre de la materia">
-      <button type="button" class="btn btn-outline-danger" data-action="rm-reg-row" aria-label="Quitar materia"><i class="bi bi-trash"></i></button>`;
+      <div class="input-group mb-3">
+        <span class="input-group-text"><i class="bi bi-book"></i></span>
+        <input type="text" class="form-control" data-field="nombre" placeholder="Materia. Ej. Cálculo Diferencial" maxlength="60" value="${esc(value)}" aria-label="Nombre de la materia">
+        <button type="button" class="btn btn-outline-danger" data-action="rm-reg-row" aria-label="Quitar materia"><i class="bi bi-trash"></i></button>
+      </div>
+      <div class="unidades-grid">${unidades}</div>
+      <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mt-3">
+        <span class="small text-muted">Captura solo las unidades que ya tengas.</span>
+        <span class="small">Promedio de la materia: <span data-role="prom">${gradeBadge(null)}</span></span>
+      </div>`;
     $('#regMaterias').appendChild(row);
+  }
+
+  /** Recalcula el promedio que se ve en una tarjeta de materia del registro */
+  function updateRegProm(row) {
+    const vals = $$('[data-unidad]', row).map((i) => i.value.trim())
+      .filter((v) => v !== '' && !isNaN(Number(v)))
+      .map((v) => ({ calificacion: clamp(Number(v)) }));
+    $('[data-role="prom"]', row).innerHTML = gradeBadge(avgUnidades(vals), true);
   }
 
   function showRegError(msg) {
@@ -327,9 +540,10 @@
     el.scrollIntoView({ behavior: 'smooth', block: 'center' });
   }
 
-  function handleRegister(e) {
+  async function handleRegister(e) {
     e.preventDefault();
     $('#regError').classList.add('d-none');
+    const form = e.target;
 
     const nombre = $('#regNombre').value.trim();
     const id = $('#regId').value.trim();
@@ -337,49 +551,83 @@
 
     if (!nombre || !carrera) return showRegError('Completa tu nombre y tu carrera.');
     if (!ID_REGEX.test(id)) return showRegError('El número de control debe tener 4–20 caracteres (letras, números o guion).');
-    if (findStudent(id)) return showRegError('Ese número de control ya está registrado. Consulta tu perfil en "Mi perfil".');
 
-    // Materias: sin vacías ni duplicadas
+    // Materias con sus unidades: sin vacías ni duplicadas
     const vistos = new Set();
     const materias = [];
-    $$('#regMaterias input').forEach((inp) => {
-      const n = inp.value.trim();
-      if (n && !vistos.has(norm(n))) {
-        vistos.add(norm(n));
-        materias.push({ id: uid(), nombre: n, calificacion: null, comentario: '' });
+    for (const row of $$('#regMaterias .reg-materia')) {
+      const n = $('[data-field="nombre"]', row).value.trim();
+      if (!n) continue;
+      if (vistos.has(norm(n))) return showRegError(`La materia "${n}" está repetida.`);
+      vistos.add(norm(n));
+      const unidades = [];
+      for (const inp of $$('[data-unidad]', row)) {
+        const raw = inp.value.trim();
+        if (raw === '') continue;
+        if (isNaN(Number(raw)) || Number(raw) < 0 || Number(raw) > 100) {
+          return showRegError(`La calificación de la unidad ${inp.dataset.unidad} de "${n}" debe estar entre 0 y 100.`);
+        }
+        unidades.push({ n: Number(inp.dataset.unidad), calificacion: clamp(Number(raw)) });
       }
-    });
+      materias.push({ nombre: n, unidades });
+    }
     if (!materias.length) return showRegError('Agrega al menos una materia que cursas.');
 
-    db.push(sanitizeStudent({ id, nombre, carrera, materias }));
-    saveDB();
-    sessionStorage.setItem(CONFIG.PROFILE_KEY, id);
-
-    e.target.reset();
-    $('#regMaterias').innerHTML = '';
-    addRegRow();
-    toast('¡Registro exitoso! Este es tu perfil.');
-    location.hash = '#/perfil';
+    const btn = $('button[type="submit"]', form);
+    btn.disabled = true;
+    try {
+      const { error } = await sb.rpc('registrar_alumno', {
+        p_numero_control: id, p_nombre: nombre, p_carrera: carrera, p_materias: materias
+      });
+      if (error) {
+        const m = error.message || '';
+        if (/duplicado/.test(m) || error.code === '23505') {
+          return showRegError('Ese número de control ya está registrado. Consúltalo en "Mi perfil".');
+        }
+        return showRegError(`No se pudo registrar: ${m}`);
+      }
+      form.reset();
+      $('#regMaterias').innerHTML = '';
+      addRegRow();
+      await abrirPerfil(id);
+      toast('¡Registro exitoso! Este es tu perfil.');
+      location.hash = '#/perfil';
+    } finally {
+      btn.disabled = false;
+    }
   }
 
   /* ========================================================
      8. VISTA: PERFIL DEL ALUMNO (solo lectura de resultados)
      ======================================================== */
   function renderProfileView() {
-    const id = sessionStorage.getItem(CONFIG.PROFILE_KEY);
-    const s = id ? findStudent(id) : null;
-    if (id && !s) sessionStorage.removeItem(CONFIG.PROFILE_KEY);
-    $('#formBuscarPerfil').classList.toggle('d-none', !!s);
-    $('#perfilResultado').innerHTML = s ? profileHTML(s) : '';
+    $('#formBuscarPerfil').classList.toggle('d-none', !!perfil);
+    $('#perfilResultado').innerHTML = perfil ? profileHTML(perfil) : '';
   }
+
+  const fechaCorta = (iso) => {
+    const d = new Date(iso);
+    return isNaN(d) ? '' : d.toLocaleDateString('es-MX', { day: '2-digit', month: 'short', year: 'numeric' });
+  };
 
   function profileHTML(s) {
     const p = promedio(s);
-    const sm = semaforo(p);
 
     const materias = s.materias.length
       ? s.materias.map((m) => {
         const k = semaforo(m.calificacion);
+        const unidades = m.unidades.length
+          ? `<div class="unidades-chips mt-3">${m.unidades.map((u) => {
+            const ku = semaforo(u.calificacion);
+            return `<span class="unit-chip sem-${ku.key}" title="Unidad ${u.n}: ${esc(ku.label)}"><small>U${u.n}</small><strong>${esc(u.calificacion)}</strong></span>`;
+          }).join('')}</div>`
+          : '';
+        const comentarios = m.comentarios.length
+          ? `<div class="mt-3"><div class="small text-muted mb-1"><i class="bi bi-chat-dots me-1"></i>Mis comentarios</div>
+              ${m.comentarios.map((c) => `
+                <div class="comentario comentario-alumno mb-1">${esc(c.texto)}<div class="small text-muted mt-1">${esc(fechaCorta(c.creadoEn))}</div></div>`).join('')}
+            </div>`
+          : '';
         return `
           <div class="card materia-card ${k.key} mb-2 shadow-sm">
             <div class="card-body py-3">
@@ -387,12 +635,20 @@
                 <h3 class="h6 mb-0">${esc(m.nombre)}</h3>
                 ${gradeBadge(m.calificacion, true)}
               </div>
-              ${m.calificacion === null ? '<p class="small text-muted mb-0 mt-2">Aún sin calificación asignada por el manager.</p>' : ''}
-              ${m.comentario ? `<div class="comentario mt-2"><i class="bi bi-chat-left-text me-1"></i>${esc(m.comentario)}</div>` : ''}
+              ${unidades || '<p class="small text-muted mb-0 mt-2">Aún no hay calificaciones por unidad.</p>'}
+              ${m.comentario ? `<div class="comentario mt-2"><i class="bi bi-chat-left-text me-1"></i><strong>Manager:</strong> ${esc(m.comentario)}</div>` : ''}
+              ${comentarios}
+              <form class="mt-3" data-form="add-comentario" data-mid="${esc(m.id)}" novalidate>
+                <label class="form-label small mb-1" for="com-${esc(m.id)}">Comentario sobre esta materia</label>
+                <div class="input-group">
+                  <textarea id="com-${esc(m.id)}" class="form-control form-control-sm" rows="2" maxlength="500" placeholder="Ej. Con este maestro tengo muchas faltas"></textarea>
+                  <button class="btn btn-outline-success" type="submit" aria-label="Enviar comentario"><i class="bi bi-send"></i></button>
+                </div>
+              </form>
             </div>
           </div>`;
       }).join('')
-      : '<p class="text-muted">Aún no has registrado materias.</p>';
+      : '<p class="text-muted">Aún no tienes materias registradas.</p>';
 
     return `
       <div class="card shadow-sm mb-3">
@@ -419,49 +675,33 @@
         <h2 class="h5 mb-0"><i class="bi bi-journal-bookmark me-1"></i>Mis materias</h2>
         <span class="text-muted small">${s.materias.length} registrada${s.materias.length === 1 ? '' : 's'}</span>
       </div>
-      ${materias}
-
-      <form class="card shadow-sm mt-3" data-form="add-materia-perfil" data-id="${esc(s.id)}" novalidate>
-        <div class="card-body">
-          <label class="form-label" for="perfilNuevaMateria">Dar de alta otra materia que cursas</label>
-          <div class="input-group">
-            <input type="text" id="perfilNuevaMateria" class="form-control" maxlength="60" placeholder="Nombre de la materia">
-            <button class="btn btn-outline-success" type="submit"><i class="bi bi-plus-lg me-1"></i>Agregar</button>
-          </div>
-          <div class="form-text">Las calificaciones y comentarios solo los asigna el manager.</div>
-        </div>
-      </form>`;
+      <p class="small text-muted">Aquí puedes dejar comentarios sobre cada materia (por ejemplo, si un maestro no te permite presentar examen o tienes muchas faltas). Los demás datos solo los modifica el manager.</p>
+      ${materias}`;
   }
 
-  function handleSearchProfile(e) {
-    e.preventDefault();
-    const err = $('#perfilError');
-    const id = $('#perfilId').value.trim();
-    const s = id ? findStudent(id) : null;
-    if (!s) {
-      err.textContent = 'No encontramos ese número de control. Verifica o regístrate primero.';
-      err.classList.remove('d-none');
-      return;
-    }
-    err.classList.add('d-none');
-    sessionStorage.setItem(CONFIG.PROFILE_KEY, s.id);
-    $('#perfilId').value = '';
-    renderProfileView();
-  }
+  /** El alumno agrega un comentario a una de sus materias (única escritura que permite RLS) */
+  async function handleAddComentario(form) {
+    const s = perfil;
+    if (!s) return;
+    const m = s.materias.find((x) => x.id === form.dataset.mid);
+    if (!m) return;
 
-  function handleAddMateriaPerfil(form) {
-    const s = findStudent(form.dataset.id);
-    const input = $('input', form);
-    const nombre = input.value.trim();
-    if (!s || !nombre) return;
-    if (s.materias.some((m) => norm(m.nombre) === norm(nombre))) {
-      toast('Esa materia ya está registrada.', 'warning');
-      return;
+    const texto = $('textarea', form).value.trim();
+    if (!texto) return toast('Escribe un comentario antes de enviarlo.', 'warning');
+    if (texto.length > 500) return toast('El comentario no puede pasar de 500 caracteres.', 'warning');
+
+    const btn = $('button[type="submit"]', form);
+    btn.disabled = true;
+    const { data, error } = await sb.rpc('agregar_comentario', {
+      p_numero_control: s.id, p_materia_id: m.id, p_texto: texto
+    });
+    if (error) {
+      btn.disabled = false;
+      return dbError('No se pudo guardar el comentario', error);
     }
-    s.materias.push({ id: uid(), nombre, calificacion: null, comentario: '' });
-    saveDB();
+    m.comentarios.push({ id: data.id, texto: data.texto, creadoEn: data.created_at });
     renderProfileView();
-    toast('Materia agregada.');
+    toast('Comentario agregado.');
   }
 
   /* ========================================================
@@ -599,10 +839,11 @@
     if (!requireManager()) return;
     const s = findStudent(id);
     if (!s) return;
-    const ok = await confirmDialog('Eliminar alumno', `¿Eliminar a ${s.nombre} (${s.id}) con todas sus materias y calificaciones? Esta acción no se puede deshacer.`, 'Eliminar');
+    const ok = await confirmDialog('Eliminar alumno', `¿Eliminar a ${s.nombre} (${s.id}) con todas sus materias, calificaciones y comentarios? Esta acción no se puede deshacer.`, 'Eliminar');
     if (!ok) return;
-    db = db.filter((x) => x !== s);
-    saveDB();
+    const { error } = await sb.from('alumnos').delete().eq('id', s.uuid);
+    if (error) return dbError('No se pudo eliminar', error);
+    await loadDB();
     renderManager();
     toast('Alumno eliminado.', 'secondary');
   }
@@ -615,7 +856,7 @@
     const s = id ? findStudent(id) : null;
     editing = {
       originalId: s ? s.id : null,
-      materias: s ? s.materias.map((m) => ({ ...m })) : [],
+      materias: s ? s.materias.map((m) => ({ ...m, unidades: m.unidades.map((u) => ({ ...u })) })) : [],
       posiciones: s ? [...s.posiciones] : [],
       creadoEn: s ? s.creadoEn : new Date().toISOString()
     };
@@ -650,18 +891,31 @@
               <label class="form-label small mb-1">Materia</label>
               <input class="form-control form-control-sm" data-field="nombre" maxlength="60" value="${esc(m.nombre)}">
             </div>
-            <div class="col-7 col-md-3">
-              <label class="form-label small mb-1">Calificación (0–100)</label>
-              <input type="number" class="form-control form-control-sm" data-field="calificacion" min="0" max="100" step="0.1" inputmode="decimal" value="${m.calificacion ?? ''}" placeholder="—">
+            <div class="col-7 col-md-4">
+              <label class="form-label small mb-1 d-block">Promedio de la materia</label>
+              <span data-role="badge">${gradeBadge(m.calificacion, true)}</span>
             </div>
-            <div class="col-5 col-md-2"><span data-role="badge">${gradeBadge(m.calificacion)}</span></div>
-            <div class="col-12 col-md-2 text-md-end">
+            <div class="col-5 col-md-3 text-end">
               <button type="button" class="btn btn-sm btn-outline-danger" data-action="rm-modal-materia" data-mid="${esc(m.id)}"><i class="bi bi-trash me-1"></i>Quitar</button>
+            </div>
+            <div class="col-12">
+              <label class="form-label small mb-1">Calificación por unidad (0–100)</label>
+              <div class="unidades-grid">
+                ${Array.from({ length: CONFIG.MAX_UNIDADES }, (_, i) => {
+                  const u = (m.unidades || []).find((x) => x.n === i + 1);
+                  return `<label class="unidad-input"><span>U${i + 1}</span><input type="number" class="form-control form-control-sm" data-unidad="${i + 1}" min="0" max="100" step="0.1" inputmode="decimal" value="${u ? u.calificacion : ''}" placeholder="—"></label>`;
+                }).join('')}
+              </div>
             </div>
             <div class="col-12">
               <label class="form-label small mb-1">Comentarios / problemas</label>
               <textarea class="form-control form-control-sm" rows="2" data-field="comentario" maxlength="500" placeholder="Observaciones o incidencias académicas">${esc(m.comentario)}</textarea>
             </div>
+            ${(m.comentarios || []).length ? `
+            <div class="col-12">
+              <div class="small text-muted mb-1"><i class="bi bi-chat-dots me-1"></i>Comentarios del alumno (solo lectura)</div>
+              ${m.comentarios.map((c) => `<div class="comentario comentario-alumno mb-1">${esc(c.texto)}<div class="small text-muted mt-1">${esc(fechaCorta(c.creadoEn))}</div></div>`).join('')}
+            </div>` : ''}
           </div>
         </div>`).join('');
     }
@@ -675,23 +929,30 @@
 
   /** Actualiza el borrador mientras se escribe (sin re-render para no perder el foco) */
   function onModalMateriaInput(e) {
-    const field = e.target.dataset.field;
     const card = e.target.closest('[data-mid]');
-    if (!field || !card) return;
+    if (!card) return;
     const m = editing.materias.find((x) => x.id === card.dataset.mid);
     if (!m) return;
 
-    if (field === 'calificacion') {
-      const v = e.target.value;
-      m.calificacion = v === '' || isNaN(Number(v)) ? null : Number(v);
-      $('[data-role="badge"]', card).innerHTML = gradeBadge(m.calificacion === null ? null : clamp(m.calificacion));
+    // Calificación de una unidad
+    if (e.target.dataset.unidad) {
+      const n = Number(e.target.dataset.unidad);
+      const v = e.target.value.trim();
+      m.unidades = (m.unidades || []).filter((u) => u.n !== n);
+      // Sin clamp aquí: al guardar se valida que esté entre 0 y 100
+      if (v !== '' && !isNaN(Number(v))) m.unidades.push({ n, calificacion: Number(v) });
+      m.unidades.sort((a, b) => a.n - b.n);
+      m.calificacion = avgUnidades(m.unidades.map((u) => ({ calificacion: clamp(u.calificacion) })));
+      $('[data-role="badge"]', card).innerHTML = gradeBadge(m.calificacion, true);
       updateModalPromedio();
-    } else {
-      m[field] = e.target.value;
+      return;
     }
+
+    const field = e.target.dataset.field;
+    if (field) m[field] = e.target.value;
   }
 
-  function saveStudentFromModal(e) {
+  async function saveStudentFromModal(e) {
     e.preventDefault();
     if (!requireManager()) return;
     const err = $('#mError');
@@ -713,13 +974,15 @@
       if (!n) return fail('Hay una materia sin nombre. Complétala o quítala.');
       if (vistos.has(norm(n))) return fail(`La materia "${n}" está repetida.`);
       vistos.add(norm(n));
-      if (m.calificacion !== null && (m.calificacion < 0 || m.calificacion > 100)) {
-        return fail(`La calificación de "${n}" debe estar entre 0 y 100.`);
+      if ((m.unidades || []).some((u) => u.calificacion < 0 || u.calificacion > 100)) {
+        return fail(`Las calificaciones por unidad de "${n}" deben estar entre 0 y 100.`);
       }
     }
 
+    const prev = editing.originalId ? findStudent(editing.originalId) : null;
     const student = sanitizeStudent({
       id, nombre, carrera,
+      uuid: prev ? prev.uuid : null,
       materias: editing.materias,
       posiciones: $$('#mPosiciones input:checked').map((i) => i.value),
       nivel: $('#mNivel').value,
@@ -727,21 +990,22 @@
       creadoEn: editing.creadoEn
     });
 
-    if (editing.originalId) {
-      const idx = db.findIndex((s) => s.id === editing.originalId);
-      if (idx >= 0) db[idx] = student; else db.push(student);
-      // Si el alumno cambió su número de control, actualiza el perfil abierto
-      if (sessionStorage.getItem(CONFIG.PROFILE_KEY) === editing.originalId) {
-        sessionStorage.setItem(CONFIG.PROFILE_KEY, student.id);
-      }
-    } else {
-      db.push(student);
+    const btn = $('button[type="submit"]', $('#formAlumno'));
+    btn.disabled = true;
+    try {
+      err.classList.add('d-none');
+      await persistStudent(student);
+      await loadDB();
+      bootstrap.Modal.getOrCreateInstance($('#studentModal')).hide();
+      renderManager();
+      toast(editing.originalId ? 'Alumno actualizado.' : 'Alumno creado.');
+    } catch (error) {
+      fail(error && error.code === '23505'
+        ? 'Ya existe otro alumno con ese número de control, o hay una materia repetida.'
+        : `No se pudo guardar: ${error && error.message ? error.message : error}`);
+    } finally {
+      btn.disabled = false;
     }
-
-    saveDB();
-    bootstrap.Modal.getOrCreateInstance($('#studentModal')).hide();
-    renderManager();
-    toast(editing.originalId ? 'Alumno actualizado.' : 'Alumno creado.');
   }
 
   /* ---------- Control de selección ---------- */
@@ -757,8 +1021,9 @@
         if (!ok) { renderManager(); return; }
       }
     }
+    const { error } = await sb.from('alumnos').update({ seleccionado: value }).eq('id', s.uuid);
+    if (error) { dbError('No se pudo actualizar la selección', error); renderManager(); return; }
     s.seleccionado = value;
-    saveDB();
     renderManager();
     toast(value ? `${s.nombre} fue seleccionado.` : `${s.nombre} ya no está en la selección.`, value ? 'success' : 'secondary');
   }
@@ -770,19 +1035,22 @@
     const ok = await confirmDialog('Seleccionar prioritarios',
       `Se seleccionarán ${pendientes.length} alumno(s) con promedio ≥ 80 y sin materias en rojo.`, 'Seleccionar', 'btn-success');
     if (!ok) return;
+    const { error } = await sb.from('alumnos').update({ seleccionado: true }).in('id', pendientes.map((s) => s.uuid));
+    if (error) return dbError('No se pudo actualizar la selección', error);
     pendientes.forEach((s) => { s.seleccionado = true; });
-    saveDB();
     renderManager();
     toast(`${pendientes.length} alumno(s) seleccionados.`);
   }
 
   async function limpiarSeleccion() {
     if (!requireManager()) return;
-    if (!db.some((s) => s.seleccionado)) return toast('No hay alumnos seleccionados.', 'info');
+    const sel = db.filter((s) => s.seleccionado);
+    if (!sel.length) return toast('No hay alumnos seleccionados.', 'info');
     const ok = await confirmDialog('Limpiar selección', 'Se quitará a todos los alumnos del equipo. Los datos académicos no se modifican.', 'Limpiar');
     if (!ok) return;
-    db.forEach((s) => { s.seleccionado = false; });
-    saveDB();
+    const { error } = await sb.from('alumnos').update({ seleccionado: false }).in('id', sel.map((s) => s.uuid));
+    if (error) return dbError('No se pudo limpiar la selección', error);
+    sel.forEach((s) => { s.seleccionado = false; });
     renderManager();
     toast('Selección reiniciada.', 'secondary');
   }
@@ -861,27 +1129,40 @@
     toast('Respaldo exportado.');
   }
 
+  /** Importa una lista de alumnos a Supabase (sobrescribe por número de control) */
+  async function importStudents(arr, titulo) {
+    const valid = arr.map(sanitizeStudent).filter(Boolean);
+    if (!valid.length) throw new Error('Sin alumnos válidos');
+
+    const ok = await confirmDialog(titulo,
+      `Se importarán ${valid.length} alumno(s). Si un número de control ya existe, se sobrescribirá con los datos recibidos.`, 'Importar', 'btn-primary');
+    if (!ok) return;
+
+    let hechos = 0;
+    try {
+      for (const s of valid) {
+        s.uuid = null; // el uuid de un respaldo no sirve en otra base
+        reconcileIds(s, findStudent(s.id));
+        await persistStudent(s);
+        hechos++;
+      }
+    } catch (error) {
+      dbError(`Importación detenida tras ${hechos} alumno(s)`, error);
+    }
+    await loadDB();
+    renderManager();
+    if (hechos) toast(`${hechos} alumno(s) importados.`);
+  }
+
   function importData(file) {
-    if (!file) return;
+    if (!file || !requireManager()) return;
     const reader = new FileReader();
     reader.onload = async () => {
       try {
         const data = JSON.parse(reader.result);
         const arr = Array.isArray(data) ? data : data.alumnos;
         if (!Array.isArray(arr)) throw new Error('Formato inválido');
-        const valid = arr.map(sanitizeStudent).filter(Boolean);
-        if (!valid.length) throw new Error('Sin alumnos válidos');
-
-        const ok = await confirmDialog('Importar respaldo',
-          `Se importarán ${valid.length} alumno(s). Si un número de control ya existe, se sobrescribirá con los datos del archivo.`, 'Importar', 'btn-primary');
-        if (!ok) return;
-        valid.forEach((s) => {
-          const i = db.findIndex((x) => norm(x.id) === norm(s.id));
-          if (i >= 0) db[i] = s; else db.push(s);
-        });
-        saveDB();
-        renderManager();
-        toast(`${valid.length} alumno(s) importados.`);
+        await importStudents(arr, 'Importar respaldo');
       } catch (err) {
         toast('El archivo no es un respaldo válido.', 'danger');
       }
@@ -889,9 +1170,26 @@
     reader.readAsText(file);
   }
 
-  function loadDemo() {
+  /** Pasa a Supabase los datos que la versión anterior guardó en el localStorage de este navegador */
+  async function migrarLocal() {
     if (!requireManager()) return;
-    const M = (nombre, calificacion, comentario = '') => ({ id: uid(), nombre, calificacion, comentario });
+    let arr = [];
+    try { arr = JSON.parse(localStorage.getItem(CONFIG.LEGACY_STORAGE_KEY) || '[]'); } catch (e) { arr = []; }
+    if (!Array.isArray(arr) || !arr.length) return toast('No hay datos locales anteriores en este navegador.', 'info');
+    try {
+      await importStudents(arr, 'Migrar datos locales a Supabase');
+    } catch (err) {
+      toast('Los datos locales no son válidos.', 'danger');
+    }
+  }
+
+  async function loadDemo() {
+    if (!requireManager()) return;
+    // M(nombre, promedio, comentario): genera 4 unidades que promedian ese valor
+    const M = (nombre, base, comentario = '') => ({
+      id: uid(), nombre, comentario,
+      unidades: base === null ? [] : [-2, 2, -1, 1].map((d, i) => ({ n: i + 1, calificacion: clamp(base + d) }))
+    });
     const demo = [
       { id: 'A2026001', nombre: 'Carlos Hernández Ruiz', carrera: 'Ingeniería en Sistemas', nivel: 'Titular', posiciones: ['Pitcher'], seleccionado: true,
         materias: [M('Cálculo Diferencial', 92), M('Programación', 95, 'Excelente participación.'), M('Física', 88)] },
@@ -911,21 +1209,27 @@
         materias: [M('Contabilidad', null), M('Informática', null)] }
     ];
     let added = 0;
-    demo.map(sanitizeStudent).forEach((s) => {
-      if (!findStudent(s.id)) { db.push(s); added++; }
-    });
-    saveDB();
+    try {
+      for (const s of demo.map(sanitizeStudent)) {
+        if (findStudent(s.id)) continue;
+        await persistStudent(s);
+        added++;
+      }
+    } catch (error) {
+      dbError('No se pudieron cargar los datos de ejemplo', error);
+    }
+    await loadDB();
     renderManager();
     toast(added ? `${added} alumnos de ejemplo cargados.` : 'Los datos de ejemplo ya estaban cargados.', added ? 'success' : 'info');
   }
 
   async function wipeAll() {
     if (!requireManager()) return;
-    const ok = await confirmDialog('Borrar todos los datos', 'Se eliminarán TODOS los alumnos, materias y calificaciones de este navegador. Considera exportar un respaldo antes.', 'Borrar todo');
+    const ok = await confirmDialog('Borrar todos los datos', 'Se eliminarán TODOS los alumnos, materias, calificaciones y comentarios de Supabase. Considera exportar un respaldo antes.', 'Borrar todo');
     if (!ok) return;
-    db = [];
-    saveDB();
-    sessionStorage.removeItem(CONFIG.PROFILE_KEY);
+    const { error } = await sb.from('alumnos').delete().not('id', 'is', null);
+    if (error) return dbError('No se pudo borrar', error);
+    await loadDB();
     renderManager();
     toast('Datos eliminados.', 'secondary');
   }
@@ -942,10 +1246,10 @@
     $('#btnLogout').addEventListener('click', logout);
     $('#fileImport').addEventListener('change', (e) => { importData(e.target.files[0]); e.target.value = ''; });
 
-    // Formularios generados dinámicamente (perfil)
+    // Formularios generados dinámicamente (comentarios del alumno en su perfil)
     document.addEventListener('submit', (e) => {
-      const form = e.target.closest('[data-form="add-materia-perfil"]');
-      if (form) { e.preventDefault(); handleAddMateriaPerfil(form); }
+      const form = e.target.closest('[data-form="add-comentario"]');
+      if (form) { e.preventDefault(); handleAddComentario(form); }
     });
 
     // Filtros del panel
@@ -963,6 +1267,12 @@
     });
     $('#selPosicion').addEventListener('change', renderSeleccion);
     $('#selSoloElegibles').addEventListener('change', renderSeleccion);
+
+    // Promedio en vivo en las tarjetas de materia del registro
+    $('#regMaterias').addEventListener('input', (e) => {
+      const row = e.target.closest('.reg-materia');
+      if (row && e.target.dataset.unidad) updateRegProm(row);
+    });
 
     // Edición de materias dentro del modal
     $('#mMaterias').addEventListener('input', onModalMateriaInput);
@@ -983,14 +1293,15 @@
         // Registro
         case 'add-reg-row': addRegRow(); break;
         case 'rm-reg-row': {
-          const rows = $$('#regMaterias .input-group');
-          if (rows.length > 1) btn.closest('.input-group').remove();
-          else $('input', btn.closest('.input-group')).value = '';
+          const row = btn.closest('.reg-materia');
+          if ($$('#regMaterias .reg-materia').length > 1) row.remove();
+          else { $$('input', row).forEach((i) => { i.value = ''; }); updateRegProm(row); }
           break;
         }
         // Perfil
         case 'close-profile':
-          sessionStorage.removeItem(CONFIG.PROFILE_KEY);
+          perfil = null;
+          sessionStorage.removeItem(PERFIL_KEY);
           renderProfileView();
           break;
         // Manager
@@ -998,7 +1309,7 @@
         case 'edit-student': openStudentModal(id); break;
         case 'delete-student': deleteStudent(id); break;
         case 'add-modal-materia':
-          editing.materias.push({ id: uid(), nombre: '', calificacion: null, comentario: '' });
+          editing.materias.push({ id: uid(), nombre: '', calificacion: null, comentario: '', unidades: [], comentarios: [] });
           renderModalMaterias();
           break;
         case 'rm-modal-materia':
@@ -1011,17 +1322,9 @@
         case 'sel-clear': limpiarSeleccion(); break;
         case 'export': if (requireManager()) exportData(); break;
         case 'demo': loadDemo(); break;
+        case 'migrate-local': migrarLocal(); break;
         case 'wipe': wipeAll(); break;
         default: break;
-      }
-    });
-
-    // Sincroniza entre pestañas del navegador
-    window.addEventListener('storage', (e) => {
-      if (e.key === CONFIG.STORAGE_KEY) {
-        loadDB();
-        renderManager();
-        if (!$('[data-view="perfil"]').classList.contains('d-none')) renderProfileView();
       }
     });
 
@@ -1036,10 +1339,20 @@
     $('#mNivel').innerHTML = NIVELES.map((n) => `<option value="${n}">${n}</option>`).join('');
   }
 
-  function init() {
-    loadDB();
+  async function init() {
     fillStaticOptions();
     bindEvents();
+
+    if (!configOk()) {
+      $('#configWarning').classList.remove('d-none');
+    } else {
+      const { data } = await sb.auth.getSession();
+      await resolveRole(data.session);
+      if (isManager()) await loadDB();
+      // Reabre el perfil que el alumno tenía abierto en esta pestaña
+      const guardado = sessionStorage.getItem(PERFIL_KEY);
+      if (guardado) await abrirPerfil(guardado);
+    }
     updateAuthUI();
     route();
   }

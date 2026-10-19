@@ -1,108 +1,90 @@
 # ⚾ Sistema de Control de Alumnos y Selección de Béisbol
 
-Aplicación web 100 % frontend (HTML + CSS + JavaScript) para registrar alumnos, controlar sus calificaciones por materia y administrar la selección de béisbol. Los datos se guardan en el **LocalStorage** del navegador, por lo que no necesita servidor ni base de datos.
+Aplicación web (HTML + CSS + JavaScript) para registrar alumnos, controlar sus calificaciones por materia y administrar la selección de béisbol. Los datos y el inicio de sesión viven en **Supabase** (Postgres + Auth), protegidos con **Row Level Security (RLS)**.
 
-- Diseño responsive *mobile-first* con **Bootstrap 5** (CDN): tarjetas en celular, tablas completas en escritorio.
+- Diseño responsive *mobile-first* con **Bootstrap 5** (CDN).
 - Semáforo de calificaciones: 🟢 ≥ 80 · 🟡 70–79 · 🔴 < 70.
-- Listo para publicarse en **GitHub Pages**.
+- Frontend estático: se publica en **GitHub Pages**; el backend es Supabase.
 
 ---
 
-## 📁 Estructura del proyecto
+## 📁 Estructura
 
 ```
 .
-├── index.html   # Estructura, vistas y modales
-├── style.css    # Estilos propios (semáforo, tarjetas, tema)
-├── app.js       # Lógica: datos, login, CRUD, selección
+├── index.html            # Estructura, vistas y modales
+├── style.css             # Estilos propios
+├── app.js                # Lógica + conexión a Supabase (ver CONFIG)
+├── supabase/schema.sql   # Tablas, trigger de registro y políticas RLS
 └── README.md
 ```
 
 ---
 
-## 👥 Roles y funciones
+## 👥 Roles y permisos
 
-### Aspirante / Jugador (sin contraseña)
-- **Registro:** nombre, número de control (único), carrera y las **materias que cursa**.
-- **Mi perfil:** se consulta con el número de control. Muestra datos, materias, calificaciones con semáforo, comentarios del manager, nivel, posiciones y estatus de selección (solo lectura).
-- Puede dar de alta más materias; **no** puede editar calificaciones ni datos deportivos.
+### Alumno (sin contraseña, solo número de control)
+- **Registro:** nombre, número de control (único), carrera y las **materias que cursa con su calificación por unidad** (hasta 8 unidades; solo captura las que ya tiene). El promedio de cada materia se calcula solo.
+- **Mi perfil:** se consulta escribiendo el número de control. Muestra sus datos, materias, calificaciones con semáforo, observaciones del manager, nivel, posiciones y estatus de selección.
+- **Único cambio permitido:** agregar **comentarios** a sus materias (por ejemplo, "con este maestro tengo muchas faltas"). No puede editar calificaciones ni datos, ni borrar/editar comentarios.
 
-### Manager (usuario y contraseña)
-- **CRUD completo** de alumnos, materias, calificaciones (0–100) y comentarios/problemas por materia.
-- **Gestión deportiva:** nivel (Principiante, Intermedio, Avanzado, Titular) y posiciones (Pitcher, Catcher, 1B, 2B, 3B, SS, LF, CF, RF, DH).
-- **Filtros:** búsqueda, carrera, nivel, posición, semáforo y estatus.
-- **Selección del equipo:** candidatos ordenados por promedio, botón para seleccionar/quitar, selección automática de *prioritarios* (promedio ≥ 80 y sin materias en rojo), y mapa de **cobertura por posición**.
-- **Datos:** exportar/importar respaldo JSON, cargar datos de ejemplo y borrar todo.
-
-### 🔐 Credenciales del Manager (por defecto)
-
-| Usuario   | Contraseña    |
-|-----------|---------------|
-| `manager` | `beisbol2026` |
-
-Cámbialas en `app.js`, sección `CONFIG` (`ADMIN_USER` y `ADMIN_PASS`).
+### Manager (cuenta con rol en la tabla `managers`)
+- **CRUD completo** de alumnos, materias, calificaciones por unidad (0–100) y observaciones por materia.
+- Ve los comentarios que escriben los alumnos (solo lectura) dentro del editor del alumno.
+- **Gestión deportiva:** nivel y posiciones; **selección del equipo** con candidatos, prioritarios y cobertura por posición.
+- **Datos:** exportar/importar respaldo JSON, migrar los datos locales de la versión anterior, cargar datos de ejemplo y borrar todo.
 
 ---
 
-## ▶️ Uso en local
+## 🚀 Puesta en marcha con Supabase
 
-1. Descarga o clona el repositorio.
-2. Abre `index.html` en tu navegador (doble clic). No requiere instalar nada.
-3. Entra a **Manager**, inicia sesión y usa **Datos → Cargar datos de ejemplo** para probar.
-
-> Se necesita conexión a internet la primera vez para cargar Bootstrap desde el CDN.
-
----
-
-## 🚀 Despliegue en GitHub Pages
-
-1. Crea un repositorio en GitHub (por ejemplo `control-beisbol`).
-2. Sube los archivos desde la carpeta del proyecto:
-   ```bash
-   git init
-   git add .
-   git commit -m "Sistema de control de alumnos y selección de béisbol"
-   git branch -M main
-   git remote add origin https://github.com/TU-USUARIO/control-beisbol.git
-   git push -u origin main
+1. Crea un proyecto en [supabase.com](https://supabase.com).
+2. **SQL Editor → New query**: pega y ejecuta todo `supabase/schema.sql`. En *Table Editor* deben aparecer `alumnos`, `materias`, `unidades`, `comentarios` y `managers`.
+3. **Authentication → Users → Add user**: crea la cuenta del manager (correo + contraseña, marca *Auto Confirm User*). Luego, en el SQL Editor:
+   ```sql
+   insert into public.managers (user_id)
+   select id from auth.users where email = 'tu-correo@ejemplo.com';
    ```
-3. En GitHub ve a **Settings → Pages**.
-4. En *Build and deployment* elige **Deploy from a branch**, rama `main` y carpeta `/ (root)`. Guarda.
-5. Espera un minuto: tu sitio estará en `https://TU-USUARIO.github.io/control-beisbol/`.
+4. **Project Settings → API**: copia *Project URL* y la clave *anon / publishable* y pégalas en `CONFIG` de `app.js`:
+   ```js
+   SUPABASE_URL: 'https://xxxxx.supabase.co',
+   SUPABASE_ANON_KEY: 'eyJ...',
+   ```
+   La clave anon es pública por diseño; **nunca** pongas la `service_role` en el frontend.
+5. **Authentication → URL Configuration**: agrega la URL de tu GitHub Pages (y `http://localhost` si pruebas en local) en *Site URL*.
+6. Abre la página, entra a **Manager** y, si tenías datos de la versión anterior en este navegador, usa **Datos → Migrar datos locales anteriores** (o **Importar respaldo** con un JSON exportado).
 
----
+> Para probar en local sirve la carpeta con un servidor (`npx serve` o `python3 -m http.server`) en lugar de abrir el archivo con doble clic.
 
-## 🗄️ Modelo de datos
+### 🚀 GitHub Pages
 
-Clave de LocalStorage: `beisbol_alumnos_v1`
-
-```json
-{
-  "id": "A2026001",
-  "nombre": "Carlos Hernández Ruiz",
-  "carrera": "Ingeniería en Sistemas",
-  "materias": [
-    { "id": "k3x9a", "nombre": "Cálculo", "calificacion": 92, "comentario": "" }
-  ],
-  "posiciones": ["Pitcher"],
-  "nivel": "Titular",
-  "seleccionado": true,
-  "creadoEn": "2026-10-18T22:00:00.000Z"
-}
+```bash
+git init && git add . && git commit -m "Control de béisbol con Supabase"
+git branch -M main
+git remote add origin https://github.com/TU-USUARIO/control-beisbol.git
+git push -u origin main
 ```
+Luego **Settings → Pages → Deploy from a branch → main / (root)**.
 
 ---
 
-## ⚠️ Limitaciones y seguridad (importante)
+## 🗄️ Modelo de datos (Supabase)
 
-Este proyecto es un **prototipo sin backend**:
+| Tabla | Contenido | Quién escribe |
+|---|---|---|
+| `alumnos` | número de control, nombre, carrera, nivel, posiciones, seleccionado | Manager; el alumno se crea al registrarse (función `registrar_alumno`) |
+| `materias` | nombre y observación del manager | Manager; las del registro las crea `registrar_alumno` |
+| `unidades` | calificación de cada unidad (1–8) de una materia | Manager; las del registro las crea `registrar_alumno` |
+| `comentarios` | texto del alumno sobre una materia | **Alumno** (función `agregar_comentario`) y manager |
+| `managers` | usuarios con rol de manager | Tú, desde el SQL Editor |
 
-- **El login es simulado.** Las credenciales están en el código JavaScript y cualquiera que inspeccione la página puede verlas. Sirve para separar vistas, no para proteger información sensible.
-- **Los datos viven solo en el navegador** donde se capturan. No se comparten entre dispositivos ni usuarios; usa *Exportar/Importar* para moverlos o respaldarlos.
-- El perfil del alumno se consulta solo con el número de control (sin contraseña, según el diseño solicitado), por lo que quien conozca ese número puede ver ese perfil en el mismo navegador.
-- Si limpias los datos del navegador, se pierde la información: **exporta respaldos con regularidad**.
+### 🔒 Seguridad (RLS)
+- Las tablas solo las puede leer/escribir el **manager** (`es_manager()`); el rol sale de la tabla `managers`, no del navegador.
+- El alumno **no tiene cuenta**: usa tres funciones de Supabase (`registrar_alumno`, `consultar_perfil`, `agregar_comentario`) que solo tocan los datos del número de control indicado. No hay forma de editar calificaciones ni de listar a otros alumnos.
+- ⚠️ Como no hay contraseña, **quien conozca un número de control puede ver ese perfil y agregarle comentarios**. Si los números son fáciles de adivinar, considera añadir un NIP al registro.
 
-Para uso real con varios dispositivos y seguridad verdadera, migra la capa de datos a un backend (Node/Express, Firebase, Supabase, etc.) con autenticación real. La lógica de `app.js` está separada por secciones para facilitar ese cambio (sección 3: capa de datos).
+Notas:
+- Eliminar un alumno desde el panel borra sus materias, calificaciones y comentarios.
 
 ---
 
@@ -110,8 +92,9 @@ Para uso real con varios dispositivos y seguridad verdadera, migra la capa de da
 
 | Qué cambiar | Dónde |
 |---|---|
-| Usuario / contraseña del manager | `CONFIG` en `app.js` |
-| Posiciones y niveles | `POSICIONES` y `NIVELES` en `app.js` |
+| URL y clave de Supabase | `CONFIG` en `app.js` |
+| Posiciones y niveles | `POSICIONES` / `NIVELES` en `app.js` (y el `check` de `nivel` en `schema.sql`) |
+| Número de unidades | `MAX_UNIDADES` en `app.js` y el `check (numero between 1 and 8)` de la tabla `unidades` en `schema.sql` |
 | Umbrales del semáforo | `UMBRAL_VERDE` y `UMBRAL_AMARILLO` en `app.js` |
 | Colores del tema | Variables `:root` en `style.css` |
 

@@ -44,6 +44,10 @@
 
 <main class="container py-4" id="app">
 
+  <div id="configWarning" class="alert alert-warning d-none" role="alert">
+    <strong>Falta configurar Supabase.</strong> Abre <code>app.js</code> y pon tu <code>SUPABASE_URL</code> y tu <code>SUPABASE_ANON_KEY</code> en la sección <code>CONFIG</code> (ver README).
+  </div>
+
   <!-- =======================================================
        VISTA: INICIO
        ======================================================= -->
@@ -52,7 +56,7 @@
       <div class="hero-content">
         <span class="badge bg-light text-dark mb-3"><i class="bi bi-calendar-event me-1"></i>Temporada 2026</span>
         <h1 class="display-5 fw-bold">Control de Alumnos<br>y Selección de Béisbol</h1>
-        <p class="lead mb-0">Registra tus materias, consulta tus calificaciones y conoce tu estatus dentro del equipo.</p>
+        <p class="lead mb-0">Registra tus materias y tus calificaciones por unidad, agrega comentarios y conoce tu estatus dentro del equipo.</p>
       </div>
     </div>
 
@@ -62,7 +66,7 @@
           <div class="card-body p-4">
             <div class="icon-circle bg-success-subtle text-success mb-3"><i class="bi bi-mortarboard-fill"></i></div>
             <h2 class="h4">Soy aspirante / jugador</h2>
-            <p class="text-muted">Sin contraseña. Regístrate con tus datos y tus materias, o consulta tu perfil con tu número de control.</p>
+            <p class="text-muted">Sin contraseña. Regístrate con tus datos, tus materias y tus calificaciones, o consulta tu perfil con tu número de control para agregar comentarios.</p>
             <div class="d-grid d-sm-flex gap-2">
               <a href="#/registro" class="btn btn-success"><i class="bi bi-person-plus me-1"></i>Registrarme</a>
               <a href="#/perfil" class="btn btn-outline-success"><i class="bi bi-search me-1"></i>Ver mi perfil</a>
@@ -75,7 +79,7 @@
           <div class="card-body p-4">
             <div class="icon-circle bg-danger-subtle text-danger mb-3"><i class="bi bi-clipboard2-data-fill"></i></div>
             <h2 class="h4">Soy Manager</h2>
-            <p class="text-muted">Acceso con usuario y contraseña. Administra alumnos, calificaciones, posiciones y la selección del equipo.</p>
+            <p class="text-muted">Acceso con correo y contraseña. Administra alumnos, calificaciones, posiciones y la selección del equipo.</p>
             <a href="#/manager" class="btn btn-danger"><i class="bi bi-shield-lock me-1"></i>Entrar al panel</a>
           </div>
         </div>
@@ -101,7 +105,7 @@
     <div class="row justify-content-center">
       <div class="col-12 col-lg-8">
         <h1 class="h3 mb-1"><i class="bi bi-person-plus-fill text-success me-2"></i>Registro de aspirante</h1>
-        <p class="text-muted">Captura tus datos y las materias que cursas. Tus calificaciones las asigna el manager.</p>
+        <p class="text-muted">Captura tus datos, las materias que cursas y tu calificación en cada unidad. Después podrás consultar tu perfil con tu número de control para agregar comentarios.</p>
 
         <form id="formRegistro" class="card shadow-sm" novalidate>
           <div class="card-body p-4">
@@ -125,9 +129,10 @@
 
             <hr>
             <div class="d-flex justify-content-between align-items-center mb-2">
-              <h2 class="h6 mb-0"><i class="bi bi-journal-bookmark me-1"></i>Materias que cursas *</h2>
+              <h2 class="h6 mb-0"><i class="bi bi-journal-bookmark me-1"></i>Materias y calificaciones por unidad *</h2>
               <button type="button" class="btn btn-sm btn-outline-success" data-action="add-reg-row"><i class="bi bi-plus-lg me-1"></i>Agregar materia</button>
             </div>
+            <div class="form-text mb-2">Escribe la materia y captura la calificación de cada unidad (0–100). Hasta 8 unidades; deja vacías las que aún no tengas.</div>
             <div id="regMaterias"></div>
           </div>
           <div class="card-footer bg-transparent p-3 d-grid d-sm-flex justify-content-sm-end gap-2">
@@ -140,7 +145,7 @@
   </section>
 
   <!-- =======================================================
-       VISTA: PERFIL DEL ALUMNO (solo lectura de resultados)
+       VISTA: PERFIL DEL ALUMNO (consulta + comentarios)
        ======================================================= -->
   <section data-view="perfil" class="d-none">
     <div class="row justify-content-center">
@@ -176,12 +181,12 @@
             <div class="text-center mb-3">
               <div class="icon-circle bg-danger-subtle text-danger mx-auto mb-2"><i class="bi bi-shield-lock-fill"></i></div>
               <h1 class="h4 mb-0">Acceso de Manager</h1>
-              <p class="text-muted small">Ingresa tus credenciales</p>
+              <p class="text-muted small">Ingresa con tu cuenta de manager</p>
             </div>
             <div id="loginError" class="alert alert-danger py-2 d-none" role="alert"></div>
             <div class="mb-3">
-              <label class="form-label" for="loginUser">Usuario</label>
-              <input type="text" id="loginUser" class="form-control" autocomplete="username" required>
+              <label class="form-label" for="loginUser">Correo electrónico</label>
+              <input type="email" id="loginUser" class="form-control" autocomplete="username" required>
             </div>
             <div class="mb-3">
               <label class="form-label" for="loginPass">Contraseña</label>
@@ -207,6 +212,7 @@
             <ul class="dropdown-menu dropdown-menu-end">
               <li><button class="dropdown-item" data-action="export" type="button"><i class="bi bi-download me-2"></i>Exportar respaldo (JSON)</button></li>
               <li><label class="dropdown-item mb-0" for="fileImport" role="button"><i class="bi bi-upload me-2"></i>Importar respaldo (JSON)</label></li>
+              <li><button class="dropdown-item" data-action="migrate-local" type="button"><i class="bi bi-cloud-arrow-up me-2"></i>Migrar datos locales anteriores</button></li>
               <li><button class="dropdown-item" data-action="demo" type="button"><i class="bi bi-magic me-2"></i>Cargar datos de ejemplo</button></li>
               <li><hr class="dropdown-divider"></li>
               <li><button class="dropdown-item text-danger" data-action="wipe" type="button"><i class="bi bi-trash3 me-2"></i>Borrar todos los datos</button></li>
@@ -333,7 +339,7 @@
 </main>
 
 <footer class="text-center text-muted small py-4">
-  Sistema de Control de Alumnos y Selección de Béisbol · Datos guardados localmente en este navegador
+  Sistema de Control de Alumnos y Selección de Béisbol · Datos guardados en Supabase
 </footer>
 
 <!-- Sugerencias de carreras (autocompletado) -->
@@ -413,6 +419,7 @@
 <div class="toast-container position-fixed bottom-0 end-0 p-3" id="toastContainer"></div>
 
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.js"></script>
 <script src="app.js"></script>
 </body>
 </html>
